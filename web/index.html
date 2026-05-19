@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGPU Triangle</title>
+  <style>
+    body { margin: 0; background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="800" height="600"></canvas>
+  <script src="renderer.js"></script>
+  <script>
+    // With -sMODULARIZE=1 the script exports a factory function named createModule
+    createModule().catch(e => console.error("Module init failed:", e));
+  </script>
+</body>
+</html>

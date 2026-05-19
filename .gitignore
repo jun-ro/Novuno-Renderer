@@ -1,0 +1,6 @@
+build/
+build-wasm/
+wgpu-native/
+web/renderer.js
+web/renderer.wasm
+.claude/
