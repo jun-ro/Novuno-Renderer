@@ -596,7 +596,7 @@ void Renderer::endFrame(WGPUSurface surface) {
         uint32_t ph = (uint32_t)(vp.h * m_surfH);
         if (pw == 0 || ph == 0) { ++vi; continue; }
 
-        ensureDepth(vp, pw, ph);
+        ensureDepth(vp, m_surfW, m_surfH);
 
         // Update camera UBO
         CameraUniformsGPU cu = {};

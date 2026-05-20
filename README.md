@@ -23,7 +23,8 @@ renderer/
 │   ├── main.cpp             # platform glue + two-viewport demo
 │   ├── renderer.h           # public API
 │   ├── renderer.cpp         # implementation
-│   └── stb_image_impl.c     # stb_image translation unit
+│   ├── stb_image_impl.c     # stb_image translation unit
+│   └── metal_surface.mm     # macOS CAMetalLayer shim
 ├── web/
 │   └── index.html           # loads renderer.js / .wasm
 ├── scripts/
