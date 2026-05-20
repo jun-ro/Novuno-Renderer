@@ -25,28 +25,66 @@
 #include <GLFW/glfw3native.h>
 #endif
 
-static const char* WGSL_SHADER = R"(
-struct Uniforms {
-    rot: mat2x2<f32>,
-}
-@group(0) @binding(0) var<uniform> u: Uniforms;
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(
-        vec2<f32>( 0.0,  0.5),
-        vec2<f32>(-0.5, -0.5),
-        vec2<f32>( 0.5, -0.5)
-    );
-    let p = u.rot * pos[vi];
-    return vec4<f32>(p, 0.0, 1.0);
+#include "renderer.h"
+
+// ─── demo geometry / texture ─────────────────────────────────────────────────
+
+static std::vector<Vertex> make_cube() {
+    const float h = 0.5f;
+    // CCW winding (back-face culled), normals per face
+    std::vector<Vertex> v;
+    auto face = [&](glm::vec3 n,
+                    glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d) {
+        // two triangles: abc, acd — each vertex carries face normal and planar UVs
+        v.push_back({ a, n, {0,0} });
+        v.push_back({ b, n, {1,0} });
+        v.push_back({ c, n, {1,1} });
+        v.push_back({ a, n, {0,0} });
+        v.push_back({ c, n, {1,1} });
+        v.push_back({ d, n, {0,1} });
+    };
+    // +Z
+    face({0,0,1}, {-h,-h,h},{h,-h,h},{h,h,h},{-h,h,h});
+    // -Z  (CCW from -Z)
+    face({0,0,-1},{h,-h,-h},{-h,-h,-h},{-h,h,-h},{h,h,-h});
+    // +X
+    face({1,0,0}, {h,-h,h},{h,-h,-h},{h,h,-h},{h,h,h});
+    // -X
+    face({-1,0,0},{-h,-h,-h},{-h,-h,h},{-h,h,h},{-h,h,-h});
+    // +Y
+    face({0,1,0}, {-h,h,h},{h,h,h},{h,h,-h},{-h,h,-h});
+    // -Y
+    face({0,-1,0},{-h,-h,-h},{h,-h,-h},{h,-h,h},{-h,-h,h});
+    return v;
 }
 
-@fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.2, 0.6, 1.0, 1.0);
+// Cube already inlines indices (no shared verts) so index buffer is sequential
+static std::vector<uint32_t> make_cube_indices(size_t vertCount) {
+    std::vector<uint32_t> idx(vertCount);
+    for (uint32_t i = 0; i < (uint32_t)vertCount; ++i) idx[i] = i;
+    return idx;
 }
-)";
+
+static std::vector<uint8_t> make_checker(int size, int tiles) {
+    std::vector<uint8_t> data(size * size * 4);
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            int tx = (x * tiles) / size;
+            int ty = (y * tiles) / size;
+            bool light = (tx + ty) % 2 == 0;
+            uint8_t c = light ? 220 : 60;
+            int i = (y * size + x) * 4;
+            data[i+0] = c; data[i+1] = c; data[i+2] = c; data[i+3] = 255;
+        }
+    }
+    return data;
+}
+
+// ─── global state ────────────────────────────────────────────────────────────
 
 struct State {
     WGPUInstance instance;
@@ -54,20 +92,24 @@ struct State {
     WGPUAdapter  adapter;
     WGPUDevice   device;
     WGPUQueue    queue;
-    WGPURenderPipeline pipeline;
-    WGPUBindGroupLayout bgl;
-    WGPUBindGroup bind_group;
-    WGPUBuffer uniform_buf;
     bool surface_configured;
     int width;
     int height;
 #ifndef __EMSCRIPTEN__
     GLFWwindow* window;
 #endif
+
+    Renderer   renderer;
+    Mesh*      cubeMesh  = nullptr;
+    Texture*   checkTex  = nullptr;
+    ViewportId vpLeft    = kInvalidViewport;
+    ViewportId vpRight   = kInvalidViewport;
 };
 
 static State g_state = {};
-static float g_angle = 0.0f;
+static double g_time = 0.0;
+
+// ─── callbacks forward declarations ──────────────────────────────────────────
 
 #ifdef __EMSCRIPTEN__
 static void on_adapter(WGPURequestAdapterStatus, WGPUAdapter, WGPUStringView, void*, void*);
@@ -78,16 +120,18 @@ static void on_device(WGPURequestDeviceStatus, WGPUDevice, const char*, void*);
 #endif
 
 static void configure_surface();
-static void create_pipeline();
+static void renderer_init_scene();
 static void frame();
 
 #ifdef __EMSCRIPTEN__
-static EM_BOOL em_frame(double time_ms, void* /*userdata*/) {
-    g_angle = (float)(time_ms * 0.001);  // radians, 1 rev/~6.28 s
+static EM_BOOL em_frame(double time_ms, void* /*ud*/) {
+    g_time = time_ms * 0.001;
     frame();
     return EM_TRUE;
 }
 #endif
+
+// ─── surface creation ────────────────────────────────────────────────────────
 
 #ifndef __EMSCRIPTEN__
 static WGPUSurface create_surface_native(WGPUInstance instance, GLFWwindow* window) {
@@ -121,10 +165,18 @@ static WGPUSurface create_surface_native(WGPUInstance instance, GLFWwindow* wind
 #endif
     return wgpuInstanceCreateSurface(instance, &sdesc);
 }
+
+static void framebuffer_size_cb(GLFWwindow* /*win*/, int w, int h) {
+    g_state.width  = w;
+    g_state.height = h;
+    if (g_state.surface_configured) configure_surface();
+}
 #endif
 
+// ─── entry point ─────────────────────────────────────────────────────────────
+
 int main() {
-    g_state.width  = 800;
+    g_state.width  = 1280;
     g_state.height = 600;
 
     WGPUInstanceDescriptor idesc = {};
@@ -141,8 +193,9 @@ int main() {
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     g_state.window = glfwCreateWindow(g_state.width, g_state.height,
-                                      "WebGPU Triangle", NULL, NULL);
+                                      "WebGPU Renderer", NULL, NULL);
     if (!g_state.window) { fprintf(stderr, "glfwCreateWindow failed\n"); return 1; }
+    glfwSetFramebufferSizeCallback(g_state.window, framebuffer_size_cb);
     g_state.surface = create_surface_native(g_state.instance, g_state.window);
 #endif
 
@@ -160,18 +213,16 @@ int main() {
 #endif
 
 #ifndef __EMSCRIPTEN__
-    while (!g_state.pipeline) {
+    while (!g_state.cubeMesh) {
         wgpuInstanceProcessEvents(g_state.instance);
     }
+    double t0 = glfwGetTime();
     while (!glfwWindowShouldClose(g_state.window)) {
         glfwPollEvents();
-        g_angle += 0.01f;
+        g_time = glfwGetTime() - t0;
         frame();
     }
-    wgpuBindGroupRelease(g_state.bind_group);
-    wgpuBindGroupLayoutRelease(g_state.bgl);
-    wgpuBufferRelease(g_state.uniform_buf);
-    wgpuRenderPipelineRelease(g_state.pipeline);
+    g_state.renderer.shutdown();
     wgpuQueueRelease(g_state.queue);
     wgpuDeviceRelease(g_state.device);
     wgpuAdapterRelease(g_state.adapter);
@@ -183,11 +234,13 @@ int main() {
     return 0;
 }
 
+// ─── adapter / device callbacks ──────────────────────────────────────────────
+
 #ifdef __EMSCRIPTEN__
 static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
-                       WGPUStringView msg, void* /*ud1*/, void* /*ud2*/) {
+                        WGPUStringView msg, void* /*ud1*/, void* /*ud2*/) {
     if (status != WGPURequestAdapterStatus_Success) {
-        fprintf(stderr, "Adapter request failed: %.*s\n", (int)msg.length, msg.data);
+        fprintf(stderr, "Adapter failed: %.*s\n", (int)msg.length, msg.data);
         return;
     }
     g_state.adapter = adapter;
@@ -199,22 +252,22 @@ static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
 }
 
 static void on_device(WGPURequestDeviceStatus status, WGPUDevice device,
-                      WGPUStringView msg, void* /*ud1*/, void* /*ud2*/) {
+                       WGPUStringView msg, void* /*ud1*/, void* /*ud2*/) {
     if (status != WGPURequestDeviceStatus_Success) {
-        fprintf(stderr, "Device request failed: %.*s\n", (int)msg.length, msg.data);
+        fprintf(stderr, "Device failed: %.*s\n", (int)msg.length, msg.data);
         return;
     }
     g_state.device = device;
     g_state.queue  = wgpuDeviceGetQueue(device);
     configure_surface();
-    create_pipeline();
+    renderer_init_scene();
     emscripten_request_animation_frame_loop(em_frame, NULL);
 }
 #else
 static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
-                        const char* msg, void* /*userdata*/) {
+                        const char* msg, void* /*ud*/) {
     if (status != WGPURequestAdapterStatus_Success) {
-        fprintf(stderr, "Adapter request failed: %s\n", msg ? msg : "");
+        fprintf(stderr, "Adapter failed: %s\n", msg ? msg : "");
         return;
     }
     g_state.adapter = adapter;
@@ -225,17 +278,19 @@ static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
 }
 
 static void on_device(WGPURequestDeviceStatus status, WGPUDevice device,
-                       const char* msg, void* /*userdata*/) {
+                       const char* msg, void* /*ud*/) {
     if (status != WGPURequestDeviceStatus_Success) {
-        fprintf(stderr, "Device request failed: %s\n", msg ? msg : "");
+        fprintf(stderr, "Device failed: %s\n", msg ? msg : "");
         return;
     }
     g_state.device = device;
     g_state.queue  = wgpuDeviceGetQueue(device);
     configure_surface();
-    create_pipeline();
+    renderer_init_scene();
 }
 #endif
+
+// ─── configure surface ───────────────────────────────────────────────────────
 
 static void configure_surface() {
     WGPUSurfaceConfiguration cfg = {};
@@ -250,151 +305,65 @@ static void configure_surface() {
     g_state.surface_configured = true;
 }
 
-static void create_pipeline() {
-    // Bind group layout: one uniform buffer at binding 0, visible to vertex stage.
-    WGPUBindGroupLayoutEntry bgl_entry = {};
-    bgl_entry.binding               = 0;
-    bgl_entry.visibility            = WGPUShaderStage_Vertex;
-    bgl_entry.buffer.type           = WGPUBufferBindingType_Uniform;
-    bgl_entry.buffer.minBindingSize = 16; // mat2x2<f32> = 16 bytes
+// ─── scene init ──────────────────────────────────────────────────────────────
 
-    WGPUBindGroupLayoutDescriptor bgl_desc = {};
-    bgl_desc.entryCount = 1;
-    bgl_desc.entries    = &bgl_entry;
-    g_state.bgl = wgpuDeviceCreateBindGroupLayout(g_state.device, &bgl_desc);
+static void renderer_init_scene() {
+    g_state.renderer.init(g_state.device, g_state.queue,
+                          WGPUTextureFormat_BGRA8Unorm,
+                          (uint32_t)g_state.width, (uint32_t)g_state.height);
 
-    // Uniform buffer: 16 bytes (mat2x2<f32>), written every frame.
-    WGPUBufferDescriptor buf_desc = {};
-    buf_desc.size  = 16;
-    buf_desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-    g_state.uniform_buf = wgpuDeviceCreateBuffer(g_state.device, &buf_desc);
+    auto verts   = make_cube();
+    auto indices = make_cube_indices(verts.size());
+    g_state.cubeMesh = g_state.renderer.createMesh(verts, indices);
 
-    // Bind group.
-    WGPUBindGroupEntry bg_entry = {};
-    bg_entry.binding = 0;
-    bg_entry.buffer  = g_state.uniform_buf;
-    bg_entry.size    = 16;
+    auto checker = make_checker(256, 8);
+    g_state.checkTex = g_state.renderer.createTexture(checker.data(), 256, 256);
 
-    WGPUBindGroupDescriptor bg_desc = {};
-    bg_desc.layout     = g_state.bgl;
-    bg_desc.entryCount = 1;
-    bg_desc.entries    = &bg_entry;
-    g_state.bind_group = wgpuDeviceCreateBindGroup(g_state.device, &bg_desc);
+    Camera camLeft;
+    camLeft.position   = { 3.f, 2.f, 3.f };
+    camLeft.target     = { 0.f, 0.f, 0.f };
+    camLeft.lightDir   = glm::normalize(glm::vec3(1.f, -2.f, -1.f));
+    camLeft.lightColor = { 1.f, 0.95f, 0.85f };
 
-    // Pipeline layout.
-    WGPUPipelineLayoutDescriptor pl_desc = {};
-    pl_desc.bindGroupLayoutCount = 1;
-    pl_desc.bindGroupLayouts     = &g_state.bgl;
-    WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(g_state.device, &pl_desc);
+    Camera camRight;
+    camRight.position   = { -3.f, 1.f, -3.f };
+    camRight.target     = {  0.f, 0.f,  0.f };
+    camRight.lightDir   = glm::normalize(glm::vec3(-1.f, -1.f, 1.f));
+    camRight.lightColor = { 0.85f, 0.9f, 1.f };
 
-    // Shader.
-#ifdef __EMSCRIPTEN__
-    WGPUShaderSourceWGSL wgsl = {};
-    wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
-    wgsl.code        = { WGSL_SHADER, WGPU_STRLEN };
-    WGPUShaderModuleDescriptor sm_desc = {};
-    sm_desc.nextInChain = (WGPUChainedStruct*)&wgsl;
-#else
-    WGPUShaderModuleWGSLDescriptor wgsl = {};
-    wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-    wgsl.code        = WGSL_SHADER;
-    WGPUShaderModuleDescriptor sm_desc = {};
-    sm_desc.nextInChain = (const WGPUChainedStruct*)&wgsl;
-#endif
-    WGPUShaderModule shader = wgpuDeviceCreateShaderModule(g_state.device, &sm_desc);
-
-    WGPUBlendState blend = {};
-    blend.color.operation = WGPUBlendOperation_Add;
-    blend.color.srcFactor  = WGPUBlendFactor_One;
-    blend.color.dstFactor  = WGPUBlendFactor_Zero;
-    blend.alpha            = blend.color;
-
-    WGPUColorTargetState color_target = {};
-    color_target.format    = WGPUTextureFormat_BGRA8Unorm;
-    color_target.writeMask = WGPUColorWriteMask_All;
-    color_target.blend     = &blend;
-
-    WGPUFragmentState frag = {};
-    frag.module      = shader;
-    frag.targetCount = 1;
-    frag.targets     = &color_target;
-
-    WGPURenderPipelineDescriptor rp_desc = {};
-    rp_desc.layout        = layout;
-    rp_desc.vertex.module = shader;
-    rp_desc.primitive.topology  = WGPUPrimitiveTopology_TriangleList;
-    rp_desc.primitive.cullMode  = WGPUCullMode_None;
-    rp_desc.primitive.frontFace = WGPUFrontFace_CCW;
-    rp_desc.multisample.count   = 1;
-    rp_desc.multisample.mask    = 0xFFFFFFFF;
-    rp_desc.fragment            = &frag;
-
-#ifdef __EMSCRIPTEN__
-    frag.entryPoint           = { "fs_main", WGPU_STRLEN };
-    rp_desc.vertex.entryPoint = { "vs_main", WGPU_STRLEN };
-#else
-    frag.entryPoint           = "fs_main";
-    rp_desc.vertex.entryPoint = "vs_main";
-#endif
-
-    g_state.pipeline = wgpuDeviceCreateRenderPipeline(g_state.device, &rp_desc);
-    wgpuShaderModuleRelease(shader);
-    wgpuPipelineLayoutRelease(layout);
+    g_state.vpLeft  = g_state.renderer.addViewport(0.0f, 0.0f, 0.5f, 1.0f, camLeft);
+    g_state.vpRight = g_state.renderer.addViewport(0.5f, 0.0f, 0.5f, 1.0f, camRight);
 }
 
+// ─── per-frame ───────────────────────────────────────────────────────────────
+
 static void frame() {
-    if (!g_state.surface_configured) return;
+    if (!g_state.surface_configured || !g_state.cubeMesh) return;
 
-    // Upload rotation matrix: col-major mat2x2 [ cos -sin | sin cos ].
-    float c = cosf(g_angle);
-    float s = sinf(g_angle);
-    float rot[4] = { c, s, -s, c };
-    wgpuQueueWriteBuffer(g_state.queue, g_state.uniform_buf, 0, rot, sizeof(rot));
+    float t = (float)g_time;
 
-    WGPUSurfaceTexture st = {};
-    wgpuSurfaceGetCurrentTexture(g_state.surface, &st);
-#ifdef __EMSCRIPTEN__
-    if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
-        st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) return;
-#else
-    if (st.status != WGPUSurfaceGetCurrentTextureStatus_Success) return;
-#endif
+    // Orbit cameras
+    Camera camLeft;
+    camLeft.position   = { 3.5f * cosf(t * 0.4f), 2.0f, 3.5f * sinf(t * 0.4f) };
+    camLeft.target     = { 0, 0, 0 };
+    camLeft.lightDir   = glm::normalize(glm::vec3(1.f, -2.f, -1.f));
+    camLeft.lightColor = { 1.f, 0.95f, 0.85f };
 
-    WGPUTextureView view = wgpuTextureCreateView(st.texture, NULL);
+    Camera camRight;
+    camRight.position   = { 4.5f * cosf(t * 0.3f + 2.1f), 1.5f, 4.5f * sinf(t * 0.3f + 2.1f) };
+    camRight.target     = { 0, 0, 0 };
+    camRight.lightDir   = glm::normalize(glm::vec3(-1.f, -1.f, 1.f));
+    camRight.lightColor = { 0.85f, 0.9f, 1.f };
 
-    WGPUCommandEncoderDescriptor enc_desc = {};
-    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(g_state.device, &enc_desc);
+    g_state.renderer.setCamera(g_state.vpLeft,  camLeft);
+    g_state.renderer.setCamera(g_state.vpRight, camRight);
 
-    WGPURenderPassColorAttachment color_att = {};
-    color_att.view       = view;
-    color_att.loadOp     = WGPULoadOp_Clear;
-    color_att.storeOp    = WGPUStoreOp_Store;
-    color_att.clearValue = { 0.1, 0.1, 0.15, 1.0 };
-#ifdef __EMSCRIPTEN__
-    color_att.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-#endif
+    g_state.renderer.beginFrame((uint32_t)g_state.width, (uint32_t)g_state.height);
 
-    WGPURenderPassDescriptor rp_desc = {};
-    rp_desc.colorAttachmentCount = 1;
-    rp_desc.colorAttachments     = &color_att;
+    Material mat;
+    mat.texture = g_state.checkTex;
+    glm::mat4 model = glm::rotate(glm::mat4(1.f), t * 0.5f, glm::vec3(0, 1, 0));
+    g_state.renderer.submit(*g_state.cubeMesh, model, mat);
 
-    WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &rp_desc);
-    wgpuRenderPassEncoderSetPipeline(pass, g_state.pipeline);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, g_state.bind_group, 0, NULL);
-    wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
-    wgpuRenderPassEncoderEnd(pass);
-    wgpuRenderPassEncoderRelease(pass);
-
-    WGPUCommandBufferDescriptor cb_desc = {};
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, &cb_desc);
-    wgpuCommandEncoderRelease(encoder);
-
-    wgpuQueueSubmit(g_state.queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuTextureViewRelease(view);
-    wgpuTextureRelease(st.texture);
-
-#ifndef __EMSCRIPTEN__
-    wgpuSurfacePresent(g_state.surface);
-#endif
+    g_state.renderer.endFrame(g_state.surface);
 }

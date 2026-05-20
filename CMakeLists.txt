@@ -1,10 +1,29 @@
 cmake_minimum_required(VERSION 3.20)
-project(renderer CXX)
+project(renderer C CXX)
+
+include(FetchContent)
+
+FetchContent_Declare(glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG        1.0.1
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(glm)
+
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+)
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+    FetchContent_Populate(stb)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(SOURCES src/main.cpp)
+set(SOURCES src/main.cpp src/renderer.cpp src/stb_image_impl.c)
 
 # ── WASM / Emscripten ──────────────────────────────────────────────────────────
 if(EMSCRIPTEN)
@@ -21,7 +40,10 @@ if(EMSCRIPTEN)
         -sEXPORT_NAME="createModule"
         -sENVIRONMENT=web
         -sMODULARIZE=1
+        -sSTACK_SIZE=1048576
     )
+    target_include_directories(renderer PRIVATE ${stb_SOURCE_DIR})
+    target_link_libraries(renderer PRIVATE glm::glm)
     # Copy JS + WASM into web/ after build
     add_custom_command(TARGET renderer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
@@ -82,7 +104,8 @@ else()
         "${WGPU_NATIVE_DIR}/include"
     )
 
-    target_link_libraries(renderer PRIVATE ${WGPU_LIB} glfw)
+    target_include_directories(renderer PRIVATE ${stb_SOURCE_DIR})
+    target_link_libraries(renderer PRIVATE ${WGPU_LIB} glfw glm::glm)
 
     if(UNIX AND NOT APPLE)
         target_link_libraries(renderer PRIVATE dl pthread)
