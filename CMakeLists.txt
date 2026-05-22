@@ -41,10 +41,12 @@ if(EMSCRIPTEN)
         -sENVIRONMENT=web
         -sMODULARIZE=1
         -sSTACK_SIZE=1048576
+        -sEXPORTED_FUNCTIONS=_main,_js_beginFrame,_js_endFrame,_js_submit,_js_setCamera,_js_createMesh,_js_destroyMesh,_js_createTexture,_js_destroyTexture,_malloc,_free
+        -sEXPORTED_RUNTIME_METHODS=cwrap
     )
     target_include_directories(renderer PRIVATE ${stb_SOURCE_DIR})
     target_link_libraries(renderer PRIVATE glm::glm)
-    # Copy JS + WASM into web/ after build
+    # Copy JS + WASM into web/ and demo/ after build
     add_custom_command(TARGET renderer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_CURRENT_BINARY_DIR}/renderer.js"
@@ -52,7 +54,13 @@ if(EMSCRIPTEN)
         COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_CURRENT_BINARY_DIR}/renderer.wasm"
             "${CMAKE_SOURCE_DIR}/web/renderer.wasm"
-        COMMENT "Copying WASM artifacts to web/"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_CURRENT_BINARY_DIR}/renderer.js"
+            "${CMAKE_SOURCE_DIR}/../demo/renderer.js"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_CURRENT_BINARY_DIR}/renderer.wasm"
+            "${CMAKE_SOURCE_DIR}/../demo/renderer.wasm"
+        COMMENT "Copying WASM artifacts to web/ and demo/"
     )
 
 # ── Native ─────────────────────────────────────────────────────────────────────

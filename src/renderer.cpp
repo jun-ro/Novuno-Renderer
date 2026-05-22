@@ -510,13 +510,13 @@ void Renderer::beginFrame(uint32_t surfW, uint32_t surfH) {
 void Renderer::submit(const Mesh& mesh, const glm::mat4& transform,
                       const Material& mat) {
     for (auto& vp : m_viewports)
-        if (vp.active) vp.drawList.push_back({ &mesh, transform, &mat });
+        if (vp.active) vp.drawList.push_back({ &mesh, transform, mat });
 }
 
 void Renderer::submitTo(ViewportId id, const Mesh& mesh, const glm::mat4& transform,
                         const Material& mat) {
     for (auto& vp : m_viewports)
-        if (vp.id == id && vp.active) { vp.drawList.push_back({ &mesh, transform, &mat }); break; }
+        if (vp.id == id && vp.active) { vp.drawList.push_back({ &mesh, transform, mat }); break; }
 }
 
 void Renderer::endFrame(WGPUSurface surface) {
@@ -539,7 +539,7 @@ void Renderer::endFrame(WGPUSurface surface) {
         // Sort by material for batching
         std::stable_sort(vp.drawList.begin(), vp.drawList.end(),
             [](const DrawCall& a, const DrawCall& b) {
-                return a.material < b.material;
+                return a.material.texture < b.material.texture;
             });
         for (auto& dc : vp.drawList) {
             uint32_t slot = (uint32_t)objData.size();
@@ -648,16 +648,15 @@ void Renderer::endFrame(WGPUSurface surface) {
         wgpuRenderPassEncoderSetBindGroup(pass, 0, vp.camBG, 0, nullptr);
 
         auto& slots = vpSlots[vi];
-        const Material* lastMat = nullptr;
+        Texture* lastTex = nullptr;
         for (auto& sd : slots) {
             const DrawCall& dc = *sd.dc;
 
             // Bind material only if changed
-            Texture* tex = (dc.material && dc.material->texture)
-                           ? dc.material->texture : m_whiteTex;
-            if (dc.material != lastMat) {
+            Texture* tex = dc.material.texture ? dc.material.texture : m_whiteTex;
+            if (tex != lastTex) {
                 wgpuRenderPassEncoderSetBindGroup(pass, 1, tex->matBindGroup, 0, nullptr);
-                lastMat = dc.material;
+                lastTex = tex;
             }
 
             // Dynamic object offset

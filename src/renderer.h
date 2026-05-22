@@ -76,9 +76,9 @@ public:
 
 private:
     struct DrawCall {
-        const Mesh*     mesh;
-        glm::mat4       transform;
-        const Material* material;
+        const Mesh* mesh;
+        glm::mat4   transform;
+        Material    material;
     };
 
     struct ViewportData {

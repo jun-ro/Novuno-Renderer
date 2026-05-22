@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <unordered_map>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -35,11 +36,9 @@
 
 static std::vector<Vertex> make_cube() {
     const float h = 0.5f;
-    // CCW winding (back-face culled), normals per face
     std::vector<Vertex> v;
     auto face = [&](glm::vec3 n,
                     glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d) {
-        // two triangles: abc, acd — each vertex carries face normal and planar UVs
         v.push_back({ a, n, {0,0} });
         v.push_back({ b, n, {1,0} });
         v.push_back({ c, n, {1,1} });
@@ -47,22 +46,15 @@ static std::vector<Vertex> make_cube() {
         v.push_back({ c, n, {1,1} });
         v.push_back({ d, n, {0,1} });
     };
-    // +Z
-    face({0,0,1}, {-h,-h,h},{h,-h,h},{h,h,h},{-h,h,h});
-    // -Z  (CCW from -Z)
-    face({0,0,-1},{h,-h,-h},{-h,-h,-h},{-h,h,-h},{h,h,-h});
-    // +X
-    face({1,0,0}, {h,-h,h},{h,-h,-h},{h,h,-h},{h,h,h});
-    // -X
-    face({-1,0,0},{-h,-h,-h},{-h,-h,h},{-h,h,h},{-h,h,-h});
-    // +Y
-    face({0,1,0}, {-h,h,h},{h,h,h},{h,h,-h},{-h,h,-h});
-    // -Y
-    face({0,-1,0},{-h,-h,-h},{h,-h,-h},{h,-h,h},{-h,-h,h});
+    face({0,0,1},  {-h,-h,h},  {h,-h,h},  {h,h,h},   {-h,h,h});
+    face({0,0,-1}, {h,-h,-h},  {-h,-h,-h},{-h,h,-h}, {h,h,-h});
+    face({1,0,0},  {h,-h,h},   {h,-h,-h}, {h,h,-h},  {h,h,h});
+    face({-1,0,0}, {-h,-h,-h},{-h,-h,h},  {-h,h,h},  {-h,h,-h});
+    face({0,1,0},  {-h,h,h},   {h,h,h},   {h,h,-h},  {-h,h,-h});
+    face({0,-1,0}, {-h,-h,-h},{h,-h,-h},  {h,-h,h},  {-h,-h,h});
     return v;
 }
 
-// Cube already inlines indices (no shared verts) so index buffer is sequential
 static std::vector<uint32_t> make_cube_indices(size_t vertCount) {
     std::vector<uint32_t> idx(vertCount);
     for (uint32_t i = 0; i < (uint32_t)vertCount; ++i) idx[i] = i;
@@ -100,10 +92,11 @@ struct State {
 #endif
 
     Renderer   renderer;
-    Mesh*      cubeMesh  = nullptr;
-    Texture*   checkTex  = nullptr;
-    ViewportId vpLeft    = kInvalidViewport;
-    ViewportId vpRight   = kInvalidViewport;
+    std::unordered_map<int, Mesh*>    meshes;
+    std::unordered_map<int, Texture*> textures;
+    int nextMeshId = 0;
+    int nextTexId  = 0;
+    ViewportId vpLeft = kInvalidViewport;
 };
 
 static State g_state = {};
@@ -124,10 +117,88 @@ static void renderer_init_scene();
 static void frame();
 
 #ifdef __EMSCRIPTEN__
-static EM_BOOL em_frame(double time_ms, void* /*ud*/) {
-    g_time = time_ms * 0.001;
-    frame();
-    return EM_TRUE;
+extern "C" {
+    EMSCRIPTEN_KEEPALIVE void js_beginFrame() {
+        g_state.renderer.beginFrame((uint32_t)g_state.width, (uint32_t)g_state.height);
+    }
+
+    // verts: flat float array (8 floats per vertex: px,py,pz, nx,ny,nz, u,v)
+    // vertFloatCount: total floats (numVerts * 8)
+    EMSCRIPTEN_KEEPALIVE int js_createMesh(float* verts, int vertFloatCount,
+                                            uint32_t* indices, int indexCount) {
+        int numVerts = vertFloatCount / 8;
+        std::vector<Vertex> v(numVerts);
+        memcpy(v.data(), verts, numVerts * sizeof(Vertex));
+        std::vector<uint32_t> idx(indices, indices + indexCount);
+        Mesh* m = g_state.renderer.createMesh(v, idx);
+        int id = g_state.nextMeshId++;
+        g_state.meshes[id] = m;
+        return id;
+    }
+
+    EMSCRIPTEN_KEEPALIVE void js_destroyMesh(int id) {
+        auto it = g_state.meshes.find(id);
+        if (it == g_state.meshes.end()) return;
+        g_state.renderer.destroyMesh(it->second);
+        g_state.meshes.erase(it);
+    }
+
+    // rgba: Uint8Array of w*h*4 bytes
+    EMSCRIPTEN_KEEPALIVE int js_createTexture(uint8_t* rgba, int w, int h) {
+        Texture* t = g_state.renderer.createTexture(rgba, w, h);
+        int id = g_state.nextTexId++;
+        g_state.textures[id] = t;
+        return id;
+    }
+
+    EMSCRIPTEN_KEEPALIVE void js_destroyTexture(int id) {
+        auto it = g_state.textures.find(id);
+        if (it == g_state.textures.end()) return;
+        g_state.renderer.destroyTexture(it->second);
+        g_state.textures.erase(it);
+    }
+
+    // Full TRS submit with mesh + texture handles
+    EMSCRIPTEN_KEEPALIVE void js_submit(int meshId,
+                                         float px, float py, float pz,
+                                         float rx, float ry, float rz,
+                                         float sx, float sy, float sz,
+                                         int texId) {
+        auto mit = g_state.meshes.find(meshId);
+        if (mit == g_state.meshes.end()) return;
+        auto tit = g_state.textures.find(texId);
+        Material mat;
+        mat.texture = (tit != g_state.textures.end()) ? tit->second : nullptr;
+
+        glm::mat4 model = glm::translate(glm::mat4(1.f), glm::vec3(px, py, pz));
+        if (rx != 0.f) model = glm::rotate(model, rx, glm::vec3(1, 0, 0));
+        if (ry != 0.f) model = glm::rotate(model, ry, glm::vec3(0, 1, 0));
+        if (rz != 0.f) model = glm::rotate(model, rz, glm::vec3(0, 0, 1));
+        model = glm::scale(model, glm::vec3(sx, sy, sz));
+
+        g_state.renderer.submit(*mit->second, model, mat);
+    }
+
+    EMSCRIPTEN_KEEPALIVE void js_endFrame() {
+        g_state.renderer.endFrame(g_state.surface);
+    }
+
+    // Full camera: position, target, fov, lightDir, lightColor
+    EMSCRIPTEN_KEEPALIVE void js_setCamera(
+        float px, float py, float pz,
+        float tx, float ty, float tz,
+        float fov,
+        float lx, float ly, float lz,
+        float lr, float lg, float lb)
+    {
+        Camera cam;
+        cam.position   = { px, py, pz };
+        cam.target     = { tx, ty, tz };
+        cam.fov        = fov;
+        cam.lightDir   = glm::normalize(glm::vec3(lx, ly, lz));
+        cam.lightColor = { lr, lg, lb };
+        g_state.renderer.setCamera(g_state.vpLeft, cam);
+    }
 }
 #endif
 
@@ -179,8 +250,10 @@ int main() {
     g_state.width  = 1280;
     g_state.height = 600;
 
+    EM_ASM(console.log("[WASM] main() called"));
     WGPUInstanceDescriptor idesc = {};
     g_state.instance = wgpuCreateInstance(&idesc);
+    printf("[C] main: instance=%p\n", (void*)g_state.instance);
 
 #ifdef __EMSCRIPTEN__
     WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvas_src = {};
@@ -189,6 +262,7 @@ int main() {
     WGPUSurfaceDescriptor sdesc = {};
     sdesc.nextInChain = (WGPUChainedStruct*)&canvas_src;
     g_state.surface = wgpuInstanceCreateSurface(g_state.instance, &sdesc);
+    printf("[C] main: surface=%p\n", (void*)g_state.surface);
 #else
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -204,16 +278,18 @@ int main() {
     aopts.powerPreference   = WGPUPowerPreference_HighPerformance;
 
 #ifdef __EMSCRIPTEN__
+    printf("[C] main: requesting adapter\n");
     WGPURequestAdapterCallbackInfo adapter_cb = {};
     adapter_cb.mode     = WGPUCallbackMode_AllowSpontaneous;
     adapter_cb.callback = on_adapter;
     wgpuInstanceRequestAdapter(g_state.instance, &aopts, adapter_cb);
+    printf("[C] main: adapter request submitted\n");
 #else
     wgpuInstanceRequestAdapter(g_state.instance, &aopts, on_adapter, NULL);
 #endif
 
 #ifndef __EMSCRIPTEN__
-    while (!g_state.cubeMesh) {
+    while (g_state.vpLeft == kInvalidViewport) {
         wgpuInstanceProcessEvents(g_state.instance);
     }
     double t0 = glfwGetTime();
@@ -239,6 +315,8 @@ int main() {
 #ifdef __EMSCRIPTEN__
 static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
                         WGPUStringView msg, void* /*ud1*/, void* /*ud2*/) {
+    EM_ASM(console.log("[WASM] on_adapter called"));
+    printf("[C] on_adapter status=%d\n", (int)status);
     if (status != WGPURequestAdapterStatus_Success) {
         fprintf(stderr, "Adapter failed: %.*s\n", (int)msg.length, msg.data);
         return;
@@ -253,6 +331,7 @@ static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
 
 static void on_device(WGPURequestDeviceStatus status, WGPUDevice device,
                        WGPUStringView msg, void* /*ud1*/, void* /*ud2*/) {
+    printf("[C] on_device status=%d\n", (int)status);
     if (status != WGPURequestDeviceStatus_Success) {
         fprintf(stderr, "Device failed: %.*s\n", (int)msg.length, msg.data);
         return;
@@ -261,7 +340,60 @@ static void on_device(WGPURequestDeviceStatus status, WGPUDevice device,
     g_state.queue  = wgpuDeviceGetQueue(device);
     configure_surface();
     renderer_init_scene();
-    emscripten_request_animation_frame_loop(em_frame, NULL);
+    emscripten_run_script(
+        // cwrap handles
+        "var _bf  = Module.cwrap('js_beginFrame',   null, []);"
+        "var _ef  = Module.cwrap('js_endFrame',     null, []);"
+        "var _cm  = Module.cwrap('js_createMesh',   'number', ['number','number','number','number']);"
+        "var _dm  = Module.cwrap('js_destroyMesh',  null,     ['number']);"
+        "var _ct  = Module.cwrap('js_createTexture','number', ['number','number','number']);"
+        "var _dt  = Module.cwrap('js_destroyTexture',null,    ['number']);"
+        "var _sf  = Module.cwrap('js_submit',       null,     ['number','number','number','number','number','number','number','number','number','number','number']);"
+        "var _sc  = Module.cwrap('js_setCamera',    null,     ['number','number','number','number','number','number','number','number','number','number','number','number','number']);"
+
+        // helper: copy TypedArray into WASM heap, call fn(ptr,...), free
+        "function _withPtr(arr, fn) {"
+        "  var ptr = Module._malloc(arr.byteLength);"
+        "  Module.HEAPU8.set(new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength), ptr);"
+        "  var r = fn(ptr); Module._free(ptr); return r;"
+        "}"
+
+        "window.renderer = {"
+        // frame
+        "  beginFrame: _bf,"
+        "  endFrame:   _ef,"
+
+        // mesh: verts=Float32Array (8 floats/vertex: px py pz nx ny nz u v), indices=Uint32Array
+        "  createMesh: function(verts, indices) {"
+        "    var vPtr = Module._malloc(verts.byteLength);"
+        "    Module.HEAPF32.set(verts, vPtr >> 2);"
+        "    var iPtr = Module._malloc(indices.byteLength);"
+        "    Module.HEAPU32.set(indices, iPtr >> 2);"
+        "    var id = _cm(vPtr, verts.length, iPtr, indices.length);"
+        "    Module._free(vPtr); Module._free(iPtr);"
+        "    return id;"
+        "  },"
+        "  destroyMesh: _dm,"
+
+        // texture: rgba=Uint8Array (w*h*4 bytes)
+        "  createTexture: function(rgba, w, h) {"
+        "    return _withPtr(rgba, function(ptr){ return _ct(ptr, w, h); });"
+        "  },"
+        "  destroyTexture: _dt,"
+
+        // submit: pos/rot/size are {x,y,z} objects, rot in radians
+        "  submit: function(meshId, pos, rot, size, texId) {"
+        "    _sf(meshId, pos.x,pos.y,pos.z, rot.x,rot.y,rot.z, size.x,size.y,size.z, texId);"
+        "  },"
+
+        // camera: pos/target {x,y,z}, fov degrees, lightDir {x,y,z}, lightColor {r,g,b}
+        "  setCamera: function(pos, target, fov, lightDir, lightColor) {"
+        "    _sc(pos.x,pos.y,pos.z, target.x,target.y,target.z, fov,"
+        "        lightDir.x,lightDir.y,lightDir.z, lightColor.r,lightColor.g,lightColor.b);"
+        "  },"
+        "};"
+        "window.dispatchEvent(new CustomEvent('rendererReady'));"
+    );
 }
 #else
 static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
@@ -312,58 +444,47 @@ static void renderer_init_scene() {
                           WGPUTextureFormat_BGRA8Unorm,
                           (uint32_t)g_state.width, (uint32_t)g_state.height);
 
+    Camera cam;
+    cam.position   = { 3.f, 2.f, 3.f };
+    cam.target     = { 0.f, 0.f, 0.f };
+    cam.lightDir   = glm::normalize(glm::vec3(1.f, -2.f, -1.f));
+    cam.lightColor = { 1.f, 0.95f, 0.85f };
+    g_state.vpLeft = g_state.renderer.addViewport(0.0f, 0.0f, 1.0f, 1.0f, cam);
+
+#ifndef __EMSCRIPTEN__
+    // Native: pre-create default cube mesh (id=0) and checker texture (id=0)
     auto verts   = make_cube();
     auto indices = make_cube_indices(verts.size());
-    g_state.cubeMesh = g_state.renderer.createMesh(verts, indices);
+    g_state.meshes[g_state.nextMeshId++] = g_state.renderer.createMesh(verts, indices);
 
     auto checker = make_checker(256, 8);
-    g_state.checkTex = g_state.renderer.createTexture(checker.data(), 256, 256);
-
-    Camera camLeft;
-    camLeft.position   = { 3.f, 2.f, 3.f };
-    camLeft.target     = { 0.f, 0.f, 0.f };
-    camLeft.lightDir   = glm::normalize(glm::vec3(1.f, -2.f, -1.f));
-    camLeft.lightColor = { 1.f, 0.95f, 0.85f };
-
-    Camera camRight;
-    camRight.position   = { -3.f, 1.f, -3.f };
-    camRight.target     = {  0.f, 0.f,  0.f };
-    camRight.lightDir   = glm::normalize(glm::vec3(-1.f, -1.f, 1.f));
-    camRight.lightColor = { 0.85f, 0.9f, 1.f };
-
-    g_state.vpLeft  = g_state.renderer.addViewport(0.0f, 0.0f, 0.5f, 1.0f, camLeft);
-    g_state.vpRight = g_state.renderer.addViewport(0.5f, 0.0f, 0.5f, 1.0f, camRight);
+    g_state.textures[g_state.nextTexId++] = g_state.renderer.createTexture(checker.data(), 256, 256);
+#endif
 }
 
-// ─── per-frame ───────────────────────────────────────────────────────────────
+// ─── per-frame (native only) ─────────────────────────────────────────────────
 
 static void frame() {
-    if (!g_state.surface_configured || !g_state.cubeMesh) return;
+    if (!g_state.surface_configured) return;
+    auto mit = g_state.meshes.find(0);
+    auto tit = g_state.textures.find(0);
+    if (mit == g_state.meshes.end() || tit == g_state.textures.end()) return;
 
     float t = (float)g_time;
 
-    // Orbit cameras
-    Camera camLeft;
-    camLeft.position   = { 3.5f * cosf(t * 0.4f), 2.0f, 3.5f * sinf(t * 0.4f) };
-    camLeft.target     = { 0, 0, 0 };
-    camLeft.lightDir   = glm::normalize(glm::vec3(1.f, -2.f, -1.f));
-    camLeft.lightColor = { 1.f, 0.95f, 0.85f };
-
-    Camera camRight;
-    camRight.position   = { 4.5f * cosf(t * 0.3f + 2.1f), 1.5f, 4.5f * sinf(t * 0.3f + 2.1f) };
-    camRight.target     = { 0, 0, 0 };
-    camRight.lightDir   = glm::normalize(glm::vec3(-1.f, -1.f, 1.f));
-    camRight.lightColor = { 0.85f, 0.9f, 1.f };
-
-    g_state.renderer.setCamera(g_state.vpLeft,  camLeft);
-    g_state.renderer.setCamera(g_state.vpRight, camRight);
+    Camera cam;
+    cam.position   = { 3.5f * cosf(t * 0.4f), 2.0f, 3.5f * sinf(t * 0.4f) };
+    cam.target     = { 0, 0, 0 };
+    cam.lightDir   = glm::normalize(glm::vec3(1.f, -2.f, -1.f));
+    cam.lightColor = { 1.f, 0.95f, 0.85f };
+    g_state.renderer.setCamera(g_state.vpLeft, cam);
 
     g_state.renderer.beginFrame((uint32_t)g_state.width, (uint32_t)g_state.height);
 
     Material mat;
-    mat.texture = g_state.checkTex;
+    mat.texture = tit->second;
     glm::mat4 model = glm::rotate(glm::mat4(1.f), t * 0.5f, glm::vec3(0, 1, 0));
-    g_state.renderer.submit(*g_state.cubeMesh, model, mat);
+    g_state.renderer.submit(*mit->second, model, mat);
 
     g_state.renderer.endFrame(g_state.surface);
 }
